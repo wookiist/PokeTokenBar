@@ -29,6 +29,9 @@ final class UsageStore {
     private(set) var cursorLimits: CursorRateLimitStatus?
     private(set) var cursorLimitsUpdatedAt: Date?
     private(set) var cursorLimitsAuthExpired = false
+    private(set) var grokLimits: GrokCreditStatus?
+    private(set) var grokLimitsUpdatedAt: Date?
+    private(set) var grokLimitsAuthExpired = false
     private(set) var limitsUpdatedAt: Date?
     private(set) var limitsAvailable = true
     /// Claude 한도 인증이 만료된 **출처**. nil = 만료 아님. 성공 시 해제.
@@ -245,6 +248,7 @@ final class UsageStore {
     private let codexLimitsProvider: any CodexLimitsProviding
     private let antigravityLimitsProvider: any AntigravityLimitsProviding
     private let cursorLimitsProvider: any CursorLimitsProviding
+    private let grokLimitsProvider: any GrokLimitsProviding
     private let statusProvider: any ProviderStatusProviding
     /// 설정 저장소 — 테스트는 suite 를 주입해 실제 사용자 설정을 오염시키지 않는다.
     private let defaults: UserDefaults
@@ -355,6 +359,9 @@ final class UsageStore {
         }
         if usedToday.contains("cursor"), let usedPercent = cursorLimits?.planUsage?.usedPercent {
             add("Cursor", usedPercent)
+        }
+        if usedToday.contains("grok"), let status = grokLimits, let utilization = status.utilization(now: now) {
+            add("Grok", utilization, reset: status.activeReset(now: now), span: status.periodSpan)
         }
         return parts
     }
@@ -715,6 +722,7 @@ final class UsageStore {
     /// 한도 데이터가 최소 1개 프로바이더 로드됐는가 — 사탕 첫 실행 시드 게이트(미로딩 중 시드 방지).
     var limitsReady: Bool {
         limits != nil || !additionalLimits.isEmpty || codexLimits != nil || antigravityLimits != nil || cursorLimits != nil
+            || grokLimits != nil
     }
 
     /// burn rate 티어 — companion 표시 상태(idle/working/focus) 판정에 사용.
@@ -761,6 +769,7 @@ final class UsageStore {
          codexLimitsProvider: any CodexLimitsProviding = CodexRateLimitsProvider(),
          antigravityLimitsProvider: any AntigravityLimitsProviding = AntigravityRateLimitsProvider(),
          cursorLimitsProvider: any CursorLimitsProviding = CursorRateLimitsProvider(),
+         grokLimitsProvider: any GrokLimitsProviding = GrokRateLimitsProvider(),
          statusProvider: any ProviderStatusProviding = StatuspageStatusProvider(),
          sessionKeys: any SessionKeyManaging = SessionKeyLimitsProvider.shared,
          accountSessionKeys: @escaping @Sendable (URL) -> any SessionKeyManaging = {
@@ -783,6 +792,7 @@ final class UsageStore {
         self.codexLimitsProvider = codexLimitsProvider
         self.antigravityLimitsProvider = antigravityLimitsProvider
         self.cursorLimitsProvider = cursorLimitsProvider
+        self.grokLimitsProvider = grokLimitsProvider
         self.statusProvider = statusProvider
         self.defaults = defaults
         let d = defaults
@@ -1112,6 +1122,7 @@ final class UsageStore {
         await refreshCodexLimits()
         await refreshAntigravityLimits(allowKeychainPrompt: false)
         await refreshCursorLimits()
+        await refreshGrokLimits()
         await refreshProviderStatuses()
 
         checkLimitAlerts()
@@ -1666,6 +1677,31 @@ final class UsageStore {
             }
             AppLog.writeIfChanged("cursor-limits", "cursor limits unavailable: \(error)")
         }
+    }
+
+    private func refreshGrokLimits() async {
+        do {
+            grokLimits = try await grokLimitsProvider.fetch()
+            // nil = no Grok CLI login: nothing is left to re-authenticate.
+            grokLimitsAuthExpired = false
+            if let status = grokLimits {
+                grokLimitsUpdatedAt = Date()
+                let used = status.creditUsagePercent.map { String(format: "%.1f", $0) } ?? "nil"
+                AppLog.write("grok limits refreshed used=\(used)% period=\(status.currentPeriod?.type ?? "nil")")
+            }
+        } catch {
+            // Keep the last status: the token expires within hours and only the Grok CLI refreshes it.
+            if case LimitsError.httpStatus(let code) = error, code == 401 || code == 403 {
+                grokLimitsAuthExpired = true
+            }
+            AppLog.writeIfChanged("grok-limits", "grok limits unavailable: \(error)")
+        }
+    }
+
+    /// Grok 한도 staleness — 15분 경과 시 stale
+    var grokLimitsStale: Bool {
+        guard grokLimits != nil, let grokLimitsUpdatedAt else { return false }
+        return Date().timeIntervalSince(grokLimitsUpdatedAt) > 15 * 60
     }
 
     /// Cursor 한도 staleness — 15분 경과 시 stale

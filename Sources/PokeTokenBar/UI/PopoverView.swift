@@ -383,6 +383,7 @@ struct PopoverView: View {
         case "codex": return store.codexLimits?.hasVisibleLimit == true
         case "antigravity": return !store.disableKeychainAccess || store.antigravityHasTokenFile || store.antigravityLimits?.hasVisibleLimit == true || store.antigravityLimitsAuthExpired
         case "cursor": return store.cursorLimits?.hasVisibleLimit == true || store.cursorLimitsAuthExpired
+        case "grok": return store.grokLimits?.hasVisibleLimit == true || store.grokLimitsAuthExpired
         default: return false
         }
     }
@@ -470,6 +471,9 @@ struct PopoverView: View {
             if selectedSnapshot?.providerID == "cursor" {
                 cursorLimitsContent
             }
+            if selectedSnapshot?.providerID == "grok" {
+                grokLimitsContent
+            }
         }
     }
 
@@ -514,21 +518,61 @@ struct PopoverView: View {
     }
 
     @ViewBuilder
-    private var cursorAuthExpiredNotice: some View {
+    private var grokLimitsContent: some View {
+        if store.grokLimitsAuthExpired {
+            authExpiredNotice(title: l.grokAuthExpiredTitle, hint: l.grokAuthExpiredHint)
+        }
+        if let status = store.grokLimits, status.hasVisibleLimit {
+            if store.grokLimitsStale {
+                staleBadge(updatedAt: store.grokLimitsUpdatedAt)
+            }
+            let now = Date()
+            VStack(alignment: .leading, spacing: 4) {
+                if let utilization = status.utilization(now: now) {
+                    quotaRow(name: l.grokCreditPeriod(weekly: status.isWeekly, monthly: status.isMonthly),
+                             utilization: utilization, reset: status.activeReset(now: now), span: status.periodSpan)
+                }
+                let products = status.usedProducts(now: now)
+                if !products.isEmpty {
+                    Text(products.map { "\(grokProductName($0.product)) \(TokenFormatter.percent($0.usagePercent ?? 0))" }
+                        .joined(separator: " · "))
+                        .font(.caption)
+                        .foregroundStyle(.tertiary)
+                }
+            }
+            .opacity(store.grokLimitsAuthExpired ? 0.5 : 1)
+        }
+    }
+
+    /// Billing product ids → the names grok.com shows.
+    private func grokProductName(_ product: String?) -> String {
+        switch product {
+        case "GrokBot": return "Grok"
+        case "GrokBuild": return "Grok Build"
+        case "Api": return "API"
+        default: return product ?? ""
+        }
+    }
+
+    private func authExpiredNotice(title: String, hint: String) -> some View {
         VStack(alignment: .leading, spacing: 4) {
             HStack(spacing: 6) {
                 Image(systemName: "exclamationmark.triangle.fill")
                     .foregroundStyle(.orange)
-                Text(l.cursorAuthExpiredTitle)
+                Text(title)
                     .font(.caption).fontWeight(.medium)
             }
-            Text(l.cursorAuthExpiredHint)
+            Text(hint)
                 .font(.caption2)
                 .foregroundStyle(.secondary)
         }
         .padding(8)
         .background(Color.orange.opacity(0.1))
         .clipShape(RoundedRectangle(cornerRadius: 6))
+    }
+
+    private var cursorAuthExpiredNotice: some View {
+        authExpiredNotice(title: l.cursorAuthExpiredTitle, hint: l.cursorAuthExpiredHint)
     }
 
     @ViewBuilder
