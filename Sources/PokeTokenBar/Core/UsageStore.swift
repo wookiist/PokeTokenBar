@@ -210,6 +210,27 @@ final class UsageStore {
     /// 등록된 프로바이더 id 목록 — 확장 규약 레지스트리 무결성 테스트용.
     var registeredProviderIDs: [String] { registeredProviders.map(\.id) }
 
+    /// Providers the user switched off in Settings. Stored as an opt-out list so a newly added
+    /// provider is tracked by default. A disabled provider is not read at all: no tab, no totals,
+    /// no companion XP, no official limits.
+    private(set) var disabledProviderIDs: Set<String> = []
+    static let disabledProvidersKey = "disabledProviderIDs"
+
+    func isProviderEnabled(_ id: String) -> Bool { !disabledProviderIDs.contains(id) }
+
+    func setProviderEnabled(_ id: String, _ enabled: Bool) {
+        guard enabled != isProviderEnabled(id) else { return }
+        if enabled { disabledProviderIDs.remove(id) } else { disabledProviderIDs.insert(id) }
+        defaults.set(disabledProviderIDs.sorted(), forKey: Self.disabledProvidersKey)
+        // Drop the tab now instead of waiting for the next poll.
+        if !enabled { snapshots.removeAll { $0.providerID == id } }
+        Task { await refresh() }
+    }
+
+    private var activeProviders: [any UsageProvider] {
+        providers.filter { isProviderEnabled($0.id) }
+    }
+
     func customScanRoots(for providerID: String) -> String {
         defaults.string(forKey: CustomScanRoots.defaultsKey(for: providerID)) ?? ""
     }
@@ -786,6 +807,7 @@ final class UsageStore {
         self.statusProvider = statusProvider
         self.defaults = defaults
         let d = defaults
+        disabledProviderIDs = Set(d.stringArray(forKey: Self.disabledProvidersKey) ?? [])
         refreshInterval = d.object(forKey: "refreshInterval") as? TimeInterval ?? 120
         let storedCrit = d.object(forKey: "critThreshold") as? Double ?? 95
         critThreshold = storedCrit
@@ -945,6 +967,7 @@ final class UsageStore {
         }
 
         let todayKey = LocalUsageReader.todayKey()
+        let providers = activeProviders
 
         // ── Phase 1: daily (critical) — 메뉴바 숫자와 stale 판정은 여기서 확정.
         // 블록/주월 상세가 느리거나 멈춰도 메뉴바 숫자는 영향받지 않는다.
@@ -1037,7 +1060,8 @@ final class UsageStore {
         }
         writeParitySnapshot()
         AppLog.write("phase1 done total=\(todayTotalTokens) errors=\(errors.isEmpty ? "none" : errors.joined(separator: " | "))")
-        handleEmptyUsageRetry(schedule: scheduleEmptyRetry, hasErrors: !errors.isEmpty)
+        // Nothing to wait for when every provider is switched off.
+        handleEmptyUsageRetry(schedule: scheduleEmptyRetry && !providers.isEmpty, hasErrors: !errors.isEmpty)
 
         // ── Phase 2: 블록/주월 누적 상세 (best effort) — 실패 시 이전 값 유지
         await withTaskGroup(of: (String, ProviderEnrichment).self) { group in
@@ -1083,7 +1107,12 @@ final class UsageStore {
         // ── 한도 조회 (Keychain 프롬프트로 블로킹될 수 있어 마지막)
         // 세션 키 경로는 Keychain 을 안 읽으므로 이 토글과 무관하게 조회한다 — 토글을 켠 이유(팝업)가
         // 세션 키에는 없는데도 같이 막으면, 키를 넣은 사용자가 한도를 영영 못 본다.
-        if disableKeychainAccess && !sessionKeyConfigured {
+        if !isProviderEnabled("claude_code") {
+            // Limit alerts and candies read `limits` directly, so a disabled provider's value is cleared.
+            limits = nil
+            limitsAvailable = false
+            limitsAuthExpiry = nil
+        } else if disableKeychainAccess && !sessionKeyConfigured {
             limits = nil
             limitsAvailable = false
             limitsAuthExpiry = nil   // 조회 자체를 안 하므로 "세션 만료" 안내는 무의미 → 해제
@@ -1273,6 +1302,11 @@ final class UsageStore {
     private var additionalRefresh: Task<Void, Never>?
 
     private func refreshAdditionalClaudeLimits(allowKeychainPrompt: Bool) async {
+        guard isProviderEnabled("claude_code") else {
+            additionalLimits = []
+            additionalLimitsPending = false
+            return
+        }
         let previous = additionalRefresh
         let task = Task {
             await previous?.value
@@ -1650,6 +1684,11 @@ final class UsageStore {
     }
 
     private func refreshCursorLimits() async {
+        guard isProviderEnabled("cursor") else {
+            cursorLimits = nil
+            cursorLimitsAuthExpired = false
+            return
+        }
         do {
             cursorLimits = try await cursorLimitsProvider.fetch()
             // nil = no Cursor login or the API is switched off: nothing is left to re-authenticate.
@@ -1675,7 +1714,8 @@ final class UsageStore {
     }
 
     private func refreshAntigravityLimits(allowKeychainPrompt: Bool) async {
-        if disableKeychainAccess && !antigravityLimitsProvider.hasTokenFile {
+        if !isProviderEnabled("antigravity")
+            || (disableKeychainAccess && !antigravityLimitsProvider.hasTokenFile) {
             antigravityLimits = nil
             antigravityLimitsAuthExpired = false
             return
@@ -1764,6 +1804,10 @@ final class UsageStore {
     }
 
     private func refreshCodexLimits() async {
+        guard isProviderEnabled("codex") else {
+            codexLimits = nil
+            return
+        }
         do {
             codexLimits = try await codexLimitsProvider.fetch()
             if let status = codexLimits {
